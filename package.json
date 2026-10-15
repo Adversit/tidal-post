@@ -1,0 +1,20 @@
+{
+  "name": "tidal-post",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "潮汐邮局 - H5 休闲解谜游戏原型(8 关)",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "happy-dom": "^15.11.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10",
+    "vitest": "^2.1.4"
+  }
+}
