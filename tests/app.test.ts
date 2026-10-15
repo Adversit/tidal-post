@@ -30,6 +30,21 @@ function key(keyName: string, repeat = false) {
   window.dispatchEvent(new window.KeyboardEvent('keydown', { key: keyName, repeat }));
 }
 
+/**
+ * 带真实 pointerId 语义的指针事件。
+ * 环境缺 PointerEvent 构造器时,用显式赋值模拟,不用缺 pointerId 的 MouseEvent 顶替。
+ */
+export function ptr(type: string, x: number, y: number, id = 1): PointerEvent {
+  if (typeof window.PointerEvent === 'function') {
+    return new window.PointerEvent(type, { pointerId: id, clientX: x, clientY: y, bubbles: true });
+  }
+  const e = new window.Event(type, { bubbles: true });
+  Object.defineProperty(e, 'pointerId', { value: id });
+  Object.defineProperty(e, 'clientX', { value: x });
+  Object.defineProperty(e, 'clientY', { value: y });
+  return e as unknown as PointerEvent;
+}
+
 describe('classifySwipe 滑动判定', () => {
   it('阈值以下为点击', () => {
     expect(classifySwipe(10, 0)).toBeNull();
@@ -89,12 +104,8 @@ describe('AC10 输入等价与锁定', () => {
   it('棋盘滑动触发一次潮汐', () => {
     const h = setup('L01');
     const canvas = h.ui.canvas;
-    canvas.dispatchEvent(
-      new window.MouseEvent('pointerdown', { clientX: 100, clientY: 100, bubbles: true })
-    );
-    canvas.dispatchEvent(
-      new window.MouseEvent('pointerup', { clientX: 165, clientY: 103, bubbles: true })
-    );
+    canvas.dispatchEvent(ptr('pointerdown', 100, 100, 1));
+    canvas.dispatchEvent(ptr('pointerup', 165, 103, 1));
     expect(h.controller.state.moves).toBe(1);
   });
 });
@@ -110,12 +121,8 @@ describe('锚的 UI 流程(L05)', () => {
     const r = h.renderer;
     const cx = r.originX + (2 + 0.5) * r.cell;
     const cy = r.originY + (1 + 0.5) * r.cell;
-    h.ui.canvas.dispatchEvent(
-      new window.MouseEvent('pointerdown', { clientX: cx, clientY: cy, bubbles: true })
-    );
-    h.ui.canvas.dispatchEvent(
-      new window.MouseEvent('pointerup', { clientX: cx, clientY: cy, bubbles: true })
-    );
+    h.ui.canvas.dispatchEvent(ptr('pointerdown', cx, cy, 1));
+    h.ui.canvas.dispatchEvent(ptr('pointerup', cx, cy, 1));
     expect(h.controller.pendingAnchor).toBe('A');
 
     document.querySelector<HTMLButtonElement>('.dpad-btn[data-dir="R"]')!.click();
@@ -160,5 +167,144 @@ describe('撤回与界面状态', () => {
     document.querySelector<HTMLButtonElement>('.btn-complete-undo')!.click();
     expect(h.controller.complete).toBe(false);
     expect(document.querySelector('.overlay-complete')!.classList.contains('hidden')).toBe(true);
+  });
+});
+
+describe('R1 无 Canvas 路径的切关集成', () => {
+  it('通关后立即进入下一关:新关状态与展示正确', async () => {
+    const h = setup('L01');
+    const btnR = document.querySelector<HTMLButtonElement>('.dpad-btn[data-dir="R"]')!;
+    btnR.click();
+    await settle();
+    btnR.click(); // 通关
+    expect(h.controller.complete).toBe(true);
+    document.querySelector<HTMLButtonElement>('.btn-next')!.click(); // 不等动画回调即切关
+    await settle(); // 旧回调到达
+    expect(h.controller.level.id).toBe('L02');
+    expect(h.controller.state.moves).toBe(0);
+    expect(h.controller.deliveredCount()).toBe(0);
+    expect(h.renderer.getDisplay('A')).toMatchObject({ r: 3, c: 1, alpha: 1 }); // 船在起点且可见
+    document.querySelector<HTMLButtonElement>('.dpad-btn[data-dir="U"]')!.click();
+    expect(h.controller.state.moves).toBe(1); // 新关可正常操作
+  });
+});
+
+describe('R3 弹层键盘输入隔离', () => {
+  it('选关弹层期间方向键与 WASD 均不影响游戏,待用锚不丢失', () => {
+    const h = setup('L05');
+    h.controller.toggleAnchorSelect();
+    h.controller.pickAnchorTarget('A');
+    document.querySelector<HTMLButtonElement>('.btn-levels')!.click(); // 打开选关
+    key('ArrowRight');
+    key('d');
+    key('a');
+    key('ArrowLeft');
+    key('w');
+    key('s');
+    expect(h.controller.state.moves).toBe(0);
+    expect(h.controller.history.length).toBe(0);
+    expect(h.controller.state.anchorsLeft).toBe(1);
+    expect(h.controller.pendingAnchor).toBe('A');
+    document.querySelector<HTMLButtonElement>('.btn-close-levels')!.click(); // 关闭后恢复
+    key('ArrowRight');
+    expect(h.controller.state.moves).toBe(1);
+    expect(h.controller.state.anchorsLeft).toBe(0); // 锚被正常消耗
+  });
+
+  it('完成弹层与选关弹层切换期间输入仍隔离,且无状态冲突', async () => {
+    const h = setup('L01');
+    const btnR = document.querySelector<HTMLButtonElement>('.dpad-btn[data-dir="R"]')!;
+    btnR.click();
+    await settle();
+    btnR.click();
+    await settle();
+    expect(h.controller.complete).toBe(true);
+    key('ArrowLeft'); // 完成弹层打开中
+    expect(h.controller.state.moves).toBe(2);
+    document.querySelector<HTMLButtonElement>('.btn-complete-levels')!.click(); // 切到选关
+    expect(document.querySelector('.overlay-levels')!.classList.contains('hidden')).toBe(false);
+    key('ArrowRight');
+    expect(h.controller.state.moves).toBe(2);
+    document.querySelector<HTMLButtonElement>('.btn-close-levels')!.click(); // 返回 → 完成弹层恢复
+    expect(document.querySelector('.overlay-complete')!.classList.contains('hidden')).toBe(false);
+    document.querySelector<HTMLButtonElement>('.btn-complete-undo')!.click(); // 撤回仍可用
+    expect(h.controller.complete).toBe(false);
+  });
+});
+
+describe('R4 被拒绝的斜滑不当作点击', () => {
+  it('模糊斜滑不选择、不更换、不取消锚目标;真点击行为不变', () => {
+    const h = setup('L05');
+    document.querySelector<HTMLButtonElement>('.btn-anchor')!.click();
+    const r = h.renderer;
+    const ax = r.originX + (2 + 0.5) * r.cell;
+    const ay = r.originY + (1 + 0.5) * r.cell;
+
+    // 未选目标:模糊斜滑结束在 A 上(dx40, dy32)
+    h.ui.canvas.dispatchEvent(ptr('pointerdown', ax - 40, ay - 32, 1));
+    h.ui.canvas.dispatchEvent(ptr('pointerup', ax, ay, 1));
+    expect(h.controller.pendingAnchor).toBeNull();
+
+    // 已有目标 B:斜滑到 A 不更换
+    h.controller.pickAnchorTarget('B');
+    h.ui.canvas.dispatchEvent(ptr('pointerdown', ax - 40, ay - 32, 1));
+    h.ui.canvas.dispatchEvent(ptr('pointerup', ax, ay, 1));
+    expect(h.controller.pendingAnchor).toBe('B');
+
+    // 真正点击 A:更换为 A;再点取消
+    h.ui.canvas.dispatchEvent(ptr('pointerdown', ax, ay, 1));
+    h.ui.canvas.dispatchEvent(ptr('pointerup', ax, ay, 1));
+    expect(h.controller.pendingAnchor).toBe('A');
+    h.ui.canvas.dispatchEvent(ptr('pointerdown', ax, ay, 1));
+    h.ui.canvas.dispatchEvent(ptr('pointerup', ax, ay, 1));
+    expect(h.controller.pendingAnchor).toBeNull();
+
+    // 有效四向滑动仍走统一入口结算
+    h.ui.canvas.dispatchEvent(ptr('pointerdown', 100, 100, 1));
+    h.ui.canvas.dispatchEvent(ptr('pointerup', 160, 102, 1));
+    expect(h.controller.state.moves).toBe(1);
+  });
+});
+
+describe('R5 指针手势清理', () => {
+  it('棋盘内按下、棋盘外松开后,普通单击不产生额外移动', () => {
+    const h = setup('L03');
+    const canvas = h.ui.canvas;
+    canvas.dispatchEvent(ptr('pointerdown', 100, 100, 7));
+    // 捕获不可用的环境下,外部松开经 window 兜底送达
+    window.dispatchEvent(ptr('pointerup', 400, 400, 7));
+    expect(h.controller.state.moves).toBe(0);
+    // 若旧起点残留:(200,103)-(100,100) 会被误判为有效右滑
+    canvas.dispatchEvent(ptr('pointerdown', 200, 103, 7));
+    canvas.dispatchEvent(ptr('pointerup', 203, 105, 7)); // 小位移点击
+    expect(h.controller.state.moves).toBe(0); // 不得用旧起点误算滑动
+  });
+
+  it('pointercancel 与 lostpointercapture 后重新操作正常', async () => {
+    const h = setup('L03');
+    const canvas = h.ui.canvas;
+    canvas.dispatchEvent(ptr('pointerdown', 100, 100, 3));
+    canvas.dispatchEvent(ptr('pointercancel', 100, 100, 3));
+    canvas.dispatchEvent(ptr('pointerdown', 200, 200, 3));
+    canvas.dispatchEvent(ptr('pointerup', 260, 202, 3)); // 有效右滑
+    expect(h.controller.state.moves).toBe(1);
+    await settle(); // 动画解锁后再验证下一段手势
+
+    canvas.dispatchEvent(ptr('pointerdown', 100, 100, 4));
+    canvas.dispatchEvent(ptr('lostpointercapture', 100, 100, 4));
+    // 若旧起点残留:(303,105)-(100,100) 会被误判为有效右滑
+    canvas.dispatchEvent(ptr('pointerdown', 300, 103, 4));
+    canvas.dispatchEvent(ptr('pointerup', 303, 105, 4)); // 点击,不移动
+    expect(h.controller.state.moves).toBe(1);
+  });
+
+  it('非当前 pointerId 的事件不结束、不提交当前手势', () => {
+    const h = setup('L03');
+    const canvas = h.ui.canvas;
+    canvas.dispatchEvent(ptr('pointerdown', 100, 100, 1));
+    canvas.dispatchEvent(ptr('pointerup', 500, 100, 2)); // 其他指针
+    expect(h.controller.state.moves).toBe(0);
+    canvas.dispatchEvent(ptr('pointerup', 160, 102, 1)); // 本指针结束才提交
+    expect(h.controller.state.moves).toBe(1);
   });
 });

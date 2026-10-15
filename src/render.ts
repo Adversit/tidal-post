@@ -114,6 +114,13 @@ export class BoardRenderer {
   private ripples: Ripple[] = [];
   private flashes: Flash[] = [];
   private mails: MailFx[] = [];
+  /**
+   * 动画期间冻结的浮标画面状态(键 "r,c")。
+   * 移动动画使用潮汐开始时的占用快照,结束才切换到结算后状态。
+   */
+  private frozenPads: Map<string, boolean> | null = null;
+  /** 动画代次:切关/重挂载时递增,使旧关卡的延迟回调失效 */
+  private animGen = 0;
 
   /** 布局(css px) */
   cell = 48;
@@ -128,6 +135,11 @@ export class BoardRenderer {
   attach(level: LevelDef, controller: GameController): void {
     this.level = level;
     this.controller = controller;
+    this.animGen++; // 旧关卡未完成的动画回调全部失效
+    this.ripples = [];
+    this.flashes = [];
+    this.mails = [];
+    this.frozenPads = null;
     this.resize();
     this.snap();
     this.startLoop();
@@ -157,6 +169,7 @@ export class BoardRenderer {
   snapTo(state: GameState): void {
     this.tweens = [];
     this.fades = [];
+    this.frozenPads = null;
     this.display.clear();
     for (const b of state.boats) {
       this.display.set(b.id, {
@@ -178,12 +191,18 @@ export class BoardRenderer {
       done();
       return;
     }
+    const gen = this.animGen;
     if (this.reducedMotion || !this.ctx) {
       this.snapTo(result.state);
-      setTimeout(done, this.reducedMotion ? 40 : 0);
+      setTimeout(() => {
+        if (gen !== this.animGen) return; // 已切关:旧回调不得再解新锁
+        done();
+      }, this.reducedMotion ? 40 : 0);
       return;
     }
     const now = performanceSafeNow();
+    // 冻结本次潮汐开始时的浮标/门画面状态;动画结束才切换到结算后状态
+    this.frozenPads = this.currentPadStates();
     let hasDelivery = false;
     let hasMove = false;
     for (const e of events) {
@@ -227,27 +246,64 @@ export class BoardRenderer {
     }
     const total = (hasMove ? MOVE_MS : 0) + (hasDelivery ? DELIVER_MS : 0) + 40;
     setTimeout(() => {
+      if (gen !== this.animGen) return; // 已切关:旧回调不得写入展示状态或解锁
+      this.frozenPads = null;
       this.snapTo(result.state);
       done();
     }, total);
   }
 
-  /** 画布点击 → 船 id(锚选目标) */
+  /** 当前展示位置下的浮标占用快照(动画开始那一刻调用) */
+  private currentPadStates(): Map<string, boolean> {
+    const m = new Map<string, boolean>();
+    for (const g of this.level.gates) {
+      for (const pad of g.pads) {
+        m.set(`${pad.r},${pad.c}`, this.padActiveLive(pad.r, pad.c));
+      }
+    }
+    return m;
+  }
+
+  /** 画面用门状态(供测试断言真实绘制口径) */
+  displayGateOpen(gateId: string): boolean {
+    const g = this.level.gates.find((x) => x.id === gateId);
+    if (!g) return false;
+    return g.pads.some((p) => this.padActiveForDisplay(p.r, p.c));
+  }
+
+  /** 测试/调试:读取船的展示状态副本 */
+  getDisplay(boatId: string): { r: number; c: number; alpha: number; scale: number } | undefined {
+    const d = this.display.get(boatId);
+    return d ? { ...d } : undefined;
+  }
+
+  /** 选船命中半径:至少 22px,保证 44x44 CSS px 触控区 */
+  private hitRadius(): number {
+    return Math.max(this.cell / 2, 22);
+  }
+
+  /**
+   * 画布点击 → 船 id(锚选目标)。
+   * 命中区至少 44x44;重叠时取距船中心最近者,同距按 id 字典序(与 boats 顺序无关)。
+   */
   boatAtPoint(clientX: number, clientY: number): string | null {
     const rect = this.canvas.getBoundingClientRect();
     const x = clientX - rect.left;
     const y = clientY - rect.top;
+    const radius = this.hitRadius();
+    let best: { id: string; d: number } | null = null;
     for (const b of this.controller.state.boats) {
       if (b.delivered) continue;
       const d = this.display.get(b.id);
       if (!d || d.alpha < 0.5) continue;
       const cx = this.originX + (d.c + 0.5) * this.cell;
       const cy = this.originY + (d.r + 0.5) * this.cell;
-      if (Math.abs(x - cx) <= this.cell * 0.5 && Math.abs(y - cy) <= this.cell * 0.5) {
-        return b.id;
+      const dist = Math.hypot(x - cx, y - cy);
+      if (dist <= radius && (!best || dist < best.d || (dist === best.d && b.id < best.id))) {
+        best = { id: b.id, d: dist };
       }
     }
-    return null;
+    return best ? best.id : null;
   }
 
   private loopStarted = false;
@@ -412,8 +468,8 @@ export class BoardRenderer {
     }
   }
 
-  /** 浮标激活状态:由展示位置实时推导,与规则口径一致 */
-  private padActive(padR: number, padC: number): boolean {
+  /** 浮标实时占用:由展示位置推导 */
+  private padActiveLive(padR: number, padC: number): boolean {
     for (const b of this.controller.state.boats) {
       if (b.delivered) continue;
       const d = this.display.get(b.id);
@@ -421,6 +477,13 @@ export class BoardRenderer {
       if (Math.abs(d.r - padR) < 0.45 && Math.abs(d.c - padC) < 0.45) return true;
     }
     return false;
+  }
+
+  /** 画面用浮标状态:动画期间使用潮汐开始时的冻结快照 */
+  private padActiveForDisplay(padR: number, padC: number): boolean {
+    const frozen = this.frozenPads?.get(`${padR},${padC}`);
+    if (frozen !== undefined) return frozen;
+    return this.padActiveLive(padR, padC);
   }
 
   private drawPads(ctx: CanvasRenderingContext2D): void {
@@ -432,7 +495,7 @@ export class BoardRenderer {
         seen.add(key);
         const cx = this.originX + (pad.c + 0.5) * this.cell;
         const cy = this.originY + (pad.r + 0.5) * this.cell;
-        const active = this.padActive(pad.r, pad.c);
+        const active = this.padActiveForDisplay(pad.r, pad.c);
         const base = this.cell * (active ? 0.26 : 0.29);
         if (active) {
           ctx.save();
@@ -480,7 +543,7 @@ export class BoardRenderer {
 
   private drawGates(ctx: CanvasRenderingContext2D): void {
     for (const g of this.level.gates) {
-      const open = g.pads.some((p) => this.padActive(p.r, p.c));
+      const open = g.pads.some((p) => this.padActiveForDisplay(p.r, p.c));
       const horizontal = g.a.r === g.b.r; // 同一行 => 门在竖直边上
       // 共享边的中点与方向
       const edgeC = horizontal ? Math.max(g.a.c, g.b.c) : g.a.c + 0.5;

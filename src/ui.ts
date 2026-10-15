@@ -24,6 +24,20 @@ export function classifySwipe(dx: number, dy: number, threshold = SWIPE_THRESHOL
   return dy > 0 ? 'D' : 'U';
 }
 
+export type Gesture =
+  | { kind: 'tap' } // 小位移点击
+  | { kind: 'dir'; dir: Direction } // 有效四向滑动
+  | { kind: 'reject' }; // 被拒绝的拖动(模糊对角等),不当作点击
+
+/** 手势三态分类;reject 与 tap 严格区分,避免斜滑误选锚目标 */
+export function classifyGesture(dx: number, dy: number, threshold = SWIPE_THRESHOLD): Gesture {
+  const ax = Math.abs(dx);
+  const ay = Math.abs(dy);
+  if (Math.max(ax, ay) < threshold) return { kind: 'tap' };
+  const dir = classifySwipe(dx, dy, threshold);
+  return dir ? { kind: 'dir', dir } : { kind: 'reject' };
+}
+
 export interface UIOptions {
   root: HTMLElement;
   levels: LevelDef[];
@@ -189,15 +203,22 @@ export function buildUI(opts: UIOptions): UI {
   }
 
   // ---------- 输入:键盘 ----------
+  const anyOverlayOpen = () =>
+    !levelsOverlay.classList.contains('hidden') || !completeOverlay.classList.contains('hidden');
+
   const onKey = (e: KeyboardEvent) => {
     if (e.repeat) return; // 长按不堆积
     const target = e.target as HTMLElement | null;
     if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
     if (e.key === 'Escape') {
-      closeOverlays();
-      controller.clearPendingAnchor();
+      if (!levelsOverlay.classList.contains('hidden')) {
+        closeOverlays();
+      } else if (!anyOverlayOpen()) {
+        controller.clearPendingAnchor();
+      }
       return;
     }
+    if (anyOverlayOpen()) return; // 模态弹层期间阻断底层潮向输入
     const dir = KEYMAP[e.key];
     if (dir) {
       e.preventDefault();
@@ -209,36 +230,58 @@ export function buildUI(opts: UIOptions): UI {
 
   // ---------- 输入:棋盘滑动 / 点船下锚 ----------
   let swipePointer: { id: number; x: number; y: number } | null = null;
+  const resetGesture = () => {
+    swipePointer = null;
+  };
   const onPointerDown = (e: PointerEvent) => {
     if (swipePointer) return; // 不处理多指
     swipePointer = { id: e.pointerId, x: e.clientX, y: e.clientY };
+    try {
+      // 指针捕获:即使指针在棋盘外松开,结束事件也会送抵画布
+      canvas.setPointerCapture?.(e.pointerId);
+    } catch {
+      /* 环境不支持时由 window 级监听兜底清理 */
+    }
   };
   const onPointerUp = (e: PointerEvent) => {
     if (!swipePointer || e.pointerId !== swipePointer.id) return;
     const dx = e.clientX - swipePointer.x;
     const dy = e.clientY - swipePointer.y;
-    swipePointer = null;
-    const dir = classifySwipe(dx, dy);
-    if (dir) {
-      dispatchDir(dir);
+    swipePointer = null; // 手势结束即清理,不残留旧起点
+    const gesture = classifyGesture(dx, dy);
+    if (gesture.kind === 'dir') {
+      dispatchDir(gesture.dir);
       return;
     }
-    // 视为点击:锚选船模式下点船
+    if (gesture.kind === 'reject') return; // 被拒绝的拖动不当作点击
+    // 点击:锚选船模式下点船
     if (controller.anchorSelecting && renderer) {
       const id = renderer.boatAtPoint(e.clientX, e.clientY);
       if (id) controller.pickAnchorTarget(id);
     }
   };
-  const onPointerCancel = () => {
-    swipePointer = null;
+  const onPointerCancel = (e: PointerEvent) => {
+    if (!swipePointer || e.pointerId === swipePointer.id) swipePointer = null;
+  };
+  // 捕获不可用时的兜底:任何位置松开/取消都清理当前手势
+  const onWindowPointerEnd = (e: Event) => {
+    const pe = e as PointerEvent;
+    if (swipePointer && pe.pointerId === swipePointer.id) swipePointer = null;
   };
   canvas.addEventListener('pointerdown', onPointerDown);
   canvas.addEventListener('pointerup', onPointerUp);
   canvas.addEventListener('pointercancel', onPointerCancel);
+  canvas.addEventListener('lostpointercapture', onPointerCancel);
+  window.addEventListener('pointerup', onWindowPointerEnd);
+  window.addEventListener('pointercancel', onWindowPointerEnd);
   disposers.push(() => {
     canvas.removeEventListener('pointerdown', onPointerDown);
     canvas.removeEventListener('pointerup', onPointerUp);
     canvas.removeEventListener('pointercancel', onPointerCancel);
+    canvas.removeEventListener('lostpointercapture', onPointerCancel);
+    window.removeEventListener('pointerup', onWindowPointerEnd);
+    window.removeEventListener('pointercancel', onWindowPointerEnd);
+    resetGesture();
   });
 
   // ---------- 工具按钮 ----------
@@ -266,6 +309,7 @@ export function buildUI(opts: UIOptions): UI {
   const openLevels = () => levelsOverlay.classList.remove('hidden');
   const closeOverlays = () => {
     levelsOverlay.classList.add('hidden');
+    if (controller.complete) completeOverlay.classList.remove('hidden'); // 从选关返回时恢复完成弹层
   };
   const onOpenLevels = () => openLevels();
   $('.btn-levels').addEventListener('click', onOpenLevels);
@@ -274,6 +318,7 @@ export function buildUI(opts: UIOptions): UI {
   const onPickLevel = (e: Event) => {
     const t = (e.target as HTMLElement).closest<HTMLElement>('.level-item');
     if (!t?.dataset.level) return;
+    resetGesture(); // 切关时清理手势状态
     closeOverlays();
     completeOverlay.classList.add('hidden');
     opts.onLevelPicked(t.dataset.level);
@@ -284,6 +329,7 @@ export function buildUI(opts: UIOptions): UI {
     const idx = levels.findIndex((l) => l.id === controller.level.id);
     const next = levels[idx + 1];
     if (!next) return;
+    resetGesture();
     completeOverlay.classList.add('hidden');
     opts.onLevelPicked(next.id);
   };
